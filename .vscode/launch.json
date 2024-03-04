@@ -8,13 +8,13 @@
             "name": "Python: Current File",
             "type": "python",
             "request": "launch",
-            "program": "/home/wangbinluo/.conda/envs/pytorch_main/bin/torchrun",
-            "python": "/home/wangbinluo/.conda/envs/pytorch_main/bin/python",
+            "program": "/home/wangbinluo/.conda/envs/llama2_sft/bin/torchrun",
+            "python": "/home/wangbinluo/.conda/envs/llama2_sft/bin/python",
             "console": "integratedTerminal",
             "justMyCode": false,
             "env": {
                 "WANDB_DISABLE": "true",
-                "name":"CUDA_VISIBLE_DEVICES", "value":"6, 7"
+                "name":"CUDA_VISIBLE_DEVICES", "value":"6,7"
             },
             "args": [
                 "--nproc_per_node=2",

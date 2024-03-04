@@ -1,9 +1,9 @@
-from transformers.cache_utils import Cache
 import torch
 import torch.distributed as dist
 from torch.testing._internal.common_utils import TestCase
-from typing import List, Optional, Tuple, Union
 from transformers import logging
+from typing import Any, Dict, List, Optional, Tuple, Union
+from transformers.cache_utils import Cache
 
 logger = logging.get_logger(__name__)
 
@@ -33,7 +33,7 @@ def _check_module_bwd(m1, m2, check_grad=False):
         if check_grad:
             param_m2 = param_m2.grad
             param_m1 = param_m1.grad
-            if "q_proj" in name or "k_proj" in name or "v_proj" in name:
+            if "q_proj" in name or "k_proj" in name or "v_proj" in name or "gate_proj" in name or "up_proj" in name:
                 # cancat the splited param_m2.grad
                 process_group = dist.group.WORLD
                 tensor_list = [torch.empty_like(param_m2) for _ in range(dist.get_world_size())]
@@ -43,7 +43,7 @@ def _check_module_bwd(m1, m2, check_grad=False):
                 # Note: torch.cat already creates a contiguous tensor.
                 first_dim = param_m2.shape[0]
                 param_m2 = torch.cat(tensor_list, dim = 0).contiguous()
-            if "o_proj" in name:
+            if "o_proj" in name or "down_proj" in name:
                 # cancat the splited param_m2.grad
                 process_group = dist.group.WORLD
                 tensor_list = [torch.empty_like(param_m2) for _ in range(dist.get_world_size())]
@@ -119,7 +119,7 @@ class RowTpLinear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         bs = 1
-        grad = grad.view(bs, 2048, 768)
+        grad = grad.view(bs, 2048, 2048)
         return grad
     
 def row_tp_linear(output):
@@ -145,14 +145,14 @@ def get_tensor_sharded_model(model, tp_size):
         # For example, we should make q shape from [2048, 2048] -> [1024, 2048]
         set_tp_size(tp_size)
         
+        layer.self_attn.tp = tp_size
+        
         q_proj = layer.self_attn.q_proj.weight
         k_proj = layer.self_attn.k_proj.weight 
         v_proj = layer.self_attn.v_proj.weight 
         o_proj = layer.self_attn.o_proj.weight  
         row_split_dim = q_proj.shape[0] // tp_size
         col_split_dim = o_proj.shape[-1] // tp_size
-        
-        layer.self_attn.tp = tp_size
         
         split_q_tensors = torch.split(q_proj, row_split_dim, dim = 0)
         split_k_tensors = torch.split(k_proj, row_split_dim, dim = 0)
@@ -175,37 +175,35 @@ def get_tensor_sharded_model(model, tp_size):
         layer.self_attn.num_key_value_heads = model.model.config.num_key_value_heads // dist.get_world_size()
         layer.self_attn.hidden_size = model.model.config.hidden_size // dist.get_world_size()
         
+        # shard the MLP part
+        layer.mlp.tp= tp_size
+        gate_proj = layer.mlp.gate_proj.weight
+        up_proj = layer.mlp.up_proj.weight
+        down_proj = layer.mlp.down_proj.weight
+        row_split_dim =  gate_proj.shape[0] // tp_size
+        col_split_dim = down_proj.shape[-1] // tp_size
+        split_gate_tensors = torch.split(gate_proj, row_split_dim, dim = 0)
+        split_up_tensors = torch.split(up_proj, row_split_dim, dim = 0)
+        split_down_tensors = torch.split(down_proj, col_split_dim, dim = -1)
+        for i in range(len(split_gate_tensors)):
+            if dist.get_rank()==i:
+                layer.mlp.gate_proj.weight.data = split_gate_tensors[i].to(f"{device}:{i}")
+                layer.mlp.up_proj.weight.data = split_up_tensors[i].to(f"{device}:{i}")
+                layer.mlp.down_proj.weight.data = split_down_tensors[i].to(f"{device}:{i}")
+   
+        bind(layer.mlp, mlp_forward, "forward") 
     
 # bind the new forward function with llama2 model's self_attn
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    def rotate_half(x):
-        """Rotates half the hidden dims of the input."""
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -220,73 +218,98 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
+    
 def forward(
-    self,
-    hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[Cache] = None,
-    output_attentions: bool = False,
-    use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
-    bsz, q_len, _ = hidden_states.size()
-    if hasattr(self, 'tp') and self.tp > 1:
-        hidden_states = input_tp_linear(hidden_states)
+        bsz, q_len, _ = hidden_states.size()
+        if hasattr(self, 'tp') and self.tp > 1:
+            hidden_states = input_tp_linear(hidden_states)
 
-    query_states = self.q_proj(hidden_states)
-    key_states = self.k_proj(hidden_states)
-    value_states = self.v_proj(hidden_states)
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # In case static cache is used, it is an instance attribute.
+        past_key_value = getattr(self, "past_key_value", past_key_value)
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; position_ids needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        causal_mask = attention_mask
+        if attention_mask is not None and cache_position is not None:
+            causal_mask = causal_mask[:, :, cache_position, : key_states.shape[-2]]
+
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        if query_states.device.type == "cuda" and causal_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
         
+        if hasattr(self, 'tp') and self.tp > 1:
+            attn_output = row_tp_linear(attn_output)
 
-    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-    kv_seq_len = key_states.shape[-2]
-    if past_key_value is not None:
-        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-    if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-    key_states = repeat_kv(key_states, self.num_key_value_groups)
-    value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-    if attention_mask is not None:
-        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-            )
-
-    if query_states.device.type == "cuda" and attention_mask is not None:
-        query_states = query_states.contiguous()
-        key_states = key_states.contiguous()
-        value_states = value_states.contiguous()
-
-    attn_output = torch.nn.functional.scaled_dot_product_attention(
-        query_states,
-        key_states,
-        value_states,
-        attn_mask=attention_mask,
-        dropout_p=self.attention_dropout if self.training else 0.0,
-        # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
-        is_causal=self.is_causal and attention_mask is None and q_len > 1,
-    )
-
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-    attn_output = self.o_proj(attn_output)
-        
-    if hasattr(self, 'tp') and self.tp > 1:
-        attn_output = row_tp_linear(attn_output)
-
-    return attn_output, None, past_key_value    
+        return attn_output, None, past_key_value 
       
         
+# bind the new forward function with llama2 model's self_attn
+import torch.nn.functional as F
+def mlp_forward(self, x):
+    if self.config.pretraining_tp > 1:
+        slice = self.intermediate_size // self.config.pretraining_tp
+        gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
+        up_proj_slices = self.up_proj.weight.split(slice, dim=0)
+        down_proj_slices = self.down_proj.weight.split(slice, dim=1)
+
+        gate_proj = torch.cat(
+            [F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1
+        )
+        up_proj = torch.cat([F.linear(x, up_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
+
+        intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
+        down_proj = [
+            F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)
+        ]
+        down_proj = sum(down_proj)
+    else:
+        if hasattr(self, 'tp') and self.tp > 1:
+            x = input_tp_linear(x)
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        if hasattr(self, 'tp') and self.tp > 1:
+            down_proj = row_tp_linear(down_proj)   
+
+    return down_proj

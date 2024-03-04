@@ -4,18 +4,15 @@ from dataclasses import dataclass, field
 from datasets import load_dataset
 from typing import Optional, Dict, Sequence
 import lazy_init
-import data_utils 
 from transformers import TrainingArguments as TrainArgs, HfArgumentParser as HfArgs
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.llama.tokenization_llama import LlamaTokenizer
-import transformers
 from torch.utils.data import DataLoader
 import torch.optim
 from torch.cuda.amp import autocast
 import torch.distributed as dist
 import time
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
 from tensor_parallel import get_tensor_sharded_model
 from transformers.models.llama.configuration_llama import LlamaConfig
 from copy import deepcopy
@@ -23,7 +20,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset
 from functools import partial
 from data_utils2 import (DataCollatorForSupervisedDataset, 
-                         setup_distributed_dataloader)
+                         setup_distributed_dataloader,
+                         all_reduce_mean)
 from tensor_parallel import _check_module, _check_module_bwd
 from torch.testing._internal.common_utils import TestCase
 import os
@@ -112,7 +110,7 @@ def train():
         cache_dir=training_args.cache_dir,
     )
     
-    config = LlamaConfig(
+    """config = LlamaConfig(
         hidden_size=768,
         intermediate_size=1024,
         num_hidden_layers=12,
@@ -121,7 +119,7 @@ def train():
         num_key_value_heads=8
     )
     
-    model = LlamaForCausalLM(config)
+    model = LlamaForCausalLM(config)"""
 
     # lazy_init
     # torch DDP can't recognize the lazy_init, use it after DDP.
@@ -176,33 +174,23 @@ def train():
     # use tp
     # TODO: TP now is imcompatiable with gradient_checkpoint, lazy_linear. 
     # Dataloader's order should be consistent across different processes when using TP, set shuffle = false
-    
-    # tensor = torch.ones(2048, 2048)
-    # tensor = tensor.view(1, 2048, 2048)
-        
-    model_tp = deepcopy(model)
-    
     if training_args.tp > 1:
-        get_tensor_sharded_model(model_tp, training_args.tp) 
-        #model_tp.tp = training_args.tp
-
-    dataset = []
-
-    for data in train_dataset: 
-        dataset.append(tokenize_batch_for_finetune_tp(data, tokenizer, training_args.model_max_length))
-         
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, max_length=training_args.model_max_length)
-    data_loader = setup_distributed_dataloader(
-        dataset=dataset,
-        batch_size=training_args.per_device_train_batch_size,
-        shuffle=True,
-        drop_last=True,
-        collate_fn=data_collator,
-        use_tp=True
-    )
-    #get_tensor_sharded_model(model_tp) 
+        #model_tp = deepcopy(model)
+        get_tensor_sharded_model(model, training_args.tp) 
+        dataset = []
+        for data in train_dataset: 
+            dataset.append(tokenize_batch_for_finetune_tp(data, tokenizer, training_args.model_max_length))   
+        data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, max_length=training_args.model_max_length)
+        data_loader = setup_distributed_dataloader(
+            dataset=dataset,
+            batch_size=training_args.per_device_train_batch_size,
+            shuffle=True,
+            drop_last=True,
+            collate_fn=data_collator,
+            use_tp=True
+        )
     
-    # unit test for TP
+    """# unit test for TP
     testcase = TestCase()
 
     data_iter = iter(data_loader)
@@ -223,6 +211,8 @@ def train():
     batch = to_device(next(data_iter), device)
     output_1 = model(**batch)
     output_tp_1 = model_tp(**batch)
+    testcase.assertEqual(output_1[0], output_tp_1[0])
+    _check_module_bwd(model, model_tp, check_grad=True)"""
 
     # traininig
     writer = SummaryWriter("/home/wangbinluo/Finetune_llama2/tensorboard")
@@ -232,7 +222,7 @@ def train():
     num_steps_per_epoch = len(data_loader)
     train_epoches  = training_args.num_train_epochs
 
-    """for _epoch in range(epoch, training_args.num_train_epochs):
+    for _epoch in range(epoch, training_args.num_train_epochs):
         for batch in data_loader:
             step += 1
             torch.cuda.synchronize()
@@ -265,7 +255,7 @@ def train():
                                 training_args.model_max_length,
                                 step_time)
             
-            data_utils.all_reduce_mean(loss) 
+            all_reduce_mean(loss) 
             print_rank0(f"Epoch:{_epoch} " +
                         f"step_{step} / total_steps_{train_epoches * num_steps_per_epoch} " +
                         f"loss: {loss.item()} " +
@@ -275,7 +265,7 @@ def train():
                         f"max_allocated_mem: {(torch.cuda.max_memory_allocated() / 1024**2):.2f}MB " +
                         f"tflops: {tflops:.2f}")
             writer.add_scalar("loss", loss.item(),step)
-            torch.cuda.empty_cache()"""
+            torch.cuda.empty_cache()
     
     model.eval()
     writer.close()

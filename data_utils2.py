@@ -16,8 +16,15 @@ import torch.distributed as dist
 from dataclasses import dataclass
 from transformers.tokenization_utils import PreTrainedTokenizer
 
+
 DatasetType = Union[Dataset, ConcatDataset, dataset_dict.Dataset]
 PathType = Union[str, os.PathLike]
+
+def all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor = tensor.data
+    tensor.div_(dist.get_world_size())
+    return tensor
 
 class StatefulDistributedSampler(DistributedSampler):
     def __init__(
