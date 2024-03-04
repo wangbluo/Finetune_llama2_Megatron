@@ -1,0 +1,73 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "/home/wangbinluo/.conda/envs/pytorch_main/bin/torchrun",
+            "python": "/home/wangbinluo/.conda/envs/pytorch_main/bin/python",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "WANDB_DISABLE": "true",
+                "name":"CUDA_VISIBLE_DEVICES", "value":"6, 7"
+            },
+            "args": [
+                "--nproc_per_node=2",
+                "/home/wangbinluo/finetune_llama2_tp/finetune_llama2.py",
+                "--model_name_or_path",
+                "/home/zhongyuting/model/Sheared-LLaMA-1.3B",
+                "--data_path",
+                "/home/wangbinluo/Finetune_llama2/1024.json",
+                "--output_dir",
+                "/home/wangbinluo/Finetune_llama2/output/logs",
+                "--lazy_init",
+                "False",
+                "--num_train_epochs",
+                "1",
+                "--per_device_train_batch_size",
+                "1",
+                "--gradient_accumulation_steps",
+                "1",
+                "--optimizer",
+                "adam",
+                "--lr_scheduler",
+                "cosine",
+                "--evaluation_strategy",
+                "no",
+                "--save_strategy",
+                "epoch",
+                "--save_total_limit",
+                "3",
+                "--logging_steps",
+                "1",
+                "--learning_rate",
+                "2e-5",
+                "--warmup_steps",
+                "100",
+                "--adam_beta1",
+                "0.9",
+                "--adam_beta2",
+                "0.95",
+                "--weight_decay",
+                "0.1",
+                "--gradient_checkpointing",
+                "False",
+                "--auto_cast",
+                "False",
+                "--use_ddp",
+                "False",
+                "--tp",
+                "2", 
+                "--model_max_length",
+                "2048",
+                "--bf16",
+                "False"
+            ]
+        }
+    ]
+}
