@@ -118,8 +118,18 @@ class RowTpLinear(torch.autograd.Function):
         
     @staticmethod
     def backward(ctx, grad):
-        bs = 1
-        grad = grad.view(bs, 2048, 2048)
+        print(grad.shape)
+        print(grad)
+        process_group = dist.group.WORLD
+        if not grad.is_contiguous():
+            grad = grad.contiguous()
+        col_split_dim = grad.shape[-1] 
+        split_tensors = torch.split(grad, col_split_dim, dim = -1)
+        for i in range(len(split_tensors)):
+            if dist.get_rank()==i:
+                grad = split_tensors[i].to(f"{device}:{i}")
+        print("split_grad_shape:",grad.shape)
+        print("split_grad:",grad)
         return grad
     
 def row_tp_linear(output):
@@ -175,7 +185,9 @@ def get_tensor_sharded_model(model, tp_size):
         layer.self_attn.num_key_value_heads = model.model.config.num_key_value_heads // dist.get_world_size()
         layer.self_attn.hidden_size = model.model.config.hidden_size // dist.get_world_size()
         
-        # shard the MLP part
+        torch.cuda.empty_cache()
+        
+        """# shard the MLP part
         layer.mlp.tp= tp_size
         gate_proj = layer.mlp.gate_proj.weight
         up_proj = layer.mlp.up_proj.weight
@@ -191,7 +203,7 @@ def get_tensor_sharded_model(model, tp_size):
                 layer.mlp.up_proj.weight.data = split_up_tensors[i].to(f"{device}:{i}")
                 layer.mlp.down_proj.weight.data = split_down_tensors[i].to(f"{device}:{i}")
    
-        bind(layer.mlp, mlp_forward, "forward") 
+        bind(layer.mlp, mlp_forward, "forward") """
     
 # bind the new forward function with llama2 model's self_attn
 def rotate_half(x):

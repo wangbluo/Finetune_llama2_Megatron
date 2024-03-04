@@ -105,12 +105,12 @@ def train():
     setup()
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     # finetune loss function has already done in LlamaForCausalLM loss function.
-    model = LlamaForCausalLM.from_pretrained(
+    """model = LlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
-    )
+    )"""
     
-    """config = LlamaConfig(
+    config = LlamaConfig(
         hidden_size=768,
         intermediate_size=1024,
         num_hidden_layers=12,
@@ -119,7 +119,7 @@ def train():
         num_key_value_heads=8
     )
     
-    model = LlamaForCausalLM(config)"""
+    model = LlamaForCausalLM(config)
 
     # lazy_init
     # torch DDP can't recognize the lazy_init, use it after DDP.
@@ -175,8 +175,8 @@ def train():
     # TODO: TP now is imcompatiable with gradient_checkpoint, lazy_linear. 
     # Dataloader's order should be consistent across different processes when using TP, set shuffle = false
     if training_args.tp > 1:
-        #model_tp = deepcopy(model)
-        get_tensor_sharded_model(model, training_args.tp) 
+        model_tp = deepcopy(model)
+        get_tensor_sharded_model(model_tp, training_args.tp) 
         dataset = []
         for data in train_dataset: 
             dataset.append(tokenize_batch_for_finetune_tp(data, tokenizer, training_args.model_max_length))   
@@ -190,14 +190,15 @@ def train():
             use_tp=True
         )
     
-    """# unit test for TP
+    # unit test for TP
+    torch.cuda.empty_cache()
     testcase = TestCase()
 
     data_iter = iter(data_loader)
     batch = to_device(next(data_iter), device)
     output = model(**batch)
     output_tp = model_tp(**batch)
-    testcase.assertEqual(output[0], output_tp[0])
+    #testcase.assertEqual(output[0], output_tp[0])
 
     output[0].backward()
     output_tp[0].backward()
@@ -212,7 +213,7 @@ def train():
     output_1 = model(**batch)
     output_tp_1 = model_tp(**batch)
     testcase.assertEqual(output_1[0], output_tp_1[0])
-    _check_module_bwd(model, model_tp, check_grad=True)"""
+    _check_module_bwd(model, model_tp, check_grad=True)
 
     # traininig
     writer = SummaryWriter("/home/wangbinluo/Finetune_llama2/tensorboard")
