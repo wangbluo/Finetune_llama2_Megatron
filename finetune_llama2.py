@@ -2,28 +2,22 @@ import torch.distributed as dist
 import torch
 from dataclasses import dataclass, field
 from datasets import load_dataset
-from typing import Optional, Dict, Sequence
-import lazy_init
+from typing import Optional
 from transformers import TrainingArguments as TrainArgs, HfArgumentParser as HfArgs
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.llama.tokenization_llama import LlamaTokenizer
-from torch.utils.data import DataLoader
-import torch.optim
-from torch.cuda.amp import autocast
 import torch.distributed as dist
 import time
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tensor_parallel import get_tensor_sharded_model
-from transformers.models.llama.configuration_llama import LlamaConfig
-from copy import deepcopy
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import Dataset
 from functools import partial
-from data_utils2 import (DataCollatorForSupervisedDataset, 
+from data_utils import (DataCollatorForSupervisedDataset, 
                          setup_distributed_dataloader,
-                         all_reduce_mean)
-from tensor_parallel import _check_module, _check_module_bwd
-from torch.testing._internal.common_utils import TestCase
+                         all_reduce_mean,
+                         tokenize_batch_for_finetune,
+                         tokenize_batch_for_finetune_tp,
+                         jload)
 import os
 
 def setup():
@@ -66,21 +60,6 @@ class TrainingArguments(TrainArgs):
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
 
-def tokenize_batch_for_finetune(batch, tokenizer: Optional[LlamaTokenizer] = None, max_length: int = 2048):
-    texts = [sample["prompt"] + sample["completion"] for sample in batch]
-    data = tokenizer(texts, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length)
-    data = {k: v.cuda() for k, v in data.items()}
-    data["labels"] = data["input_ids"].clone()
-    return data
-
-def tokenize_batch_for_finetune_tp(batch, tokenizer: Optional[LlamaTokenizer] = None, max_length: int = 2048):
-    texts = batch["prompt"] + batch["completion"]
-    data = tokenizer(texts)
-    data["input_ids"] = torch.LongTensor(data["input_ids"])
-    data["attention_mask"] = torch.LongTensor(data["attention_mask"]) 
-    data["labels"] = deepcopy(data["input_ids"])
-    return data
-
 def print_rank0(msg):
     rank = dist.get_rank()
     if rank == 0:
@@ -104,41 +83,20 @@ def train():
     parser = HfArgs((ModelArguments, DataArguments, TrainingArguments))
     setup()
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    # finetune loss function has already done in LlamaForCausalLM loss function.
-    """model = LlamaForCausalLM.from_pretrained(
+    model = LlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
-    )"""
-    
-    config = LlamaConfig(
-        hidden_size=768,
-        intermediate_size=1024,
-        num_hidden_layers=12,
-        num_attention_heads=8,
-        max_position_embeddings=1024,
-        num_key_value_heads=8
     )
-    
-    model = LlamaForCausalLM(config)
-
-    # lazy_init
-    # torch DDP can't recognize the lazy_init, use it after DDP.
-    if not training_args.use_ddp and training_args.lazy_init:
-        lazy_init.replace_layers(model)
-
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     device=torch.cuda.current_device()
     model.to(device)
 
-    # grad_checkpoint
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
-    # data process 2
     tokenizer = LlamaTokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
     tokenizer.pad_token = tokenizer.unk_token
-    dataset = load_dataset("yizhongw/self_instruct")
-    train_dataset = dataset["train"]
+    train_dataset = jload(data_args.data_path)
     data_loader = setup_distributed_dataloader(train_dataset,
         batch_size=training_args.per_device_train_batch_size,
         shuffle=True,
@@ -146,14 +104,11 @@ def train():
         collate_fn=partial(tokenize_batch_for_finetune, tokenizer=tokenizer, max_length=training_args.model_max_length),
     )
 
-    # optimizer and scheduler
-    # torch2.1 support optimizers as Adadelta Adagrad Adam AdamW SparseAdam Adamax ASGD SGD RAdam Rprop RMSprop NAdam and LBFGS.
     optimizer = torch.optim.Adam(model.parameters(), training_args.learning_rate, 
                                     [training_args.adam_beta1, training_args.adam_beta2],
                                     weight_decay=training_args.weight_decay)
+    
     if training_args.lr_scheduler== "cosine":
-        # If you want the model to converge faster, you can set T_mult to a larger value.
-        # Integer T_mult >= 1
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, 
                                                                          T_0=training_args.num_train_epochs, 
                                                                          T_mult=3, 
@@ -162,21 +117,16 @@ def train():
         scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, 
                                                       start_factor=0.5,
                                                       total_iters=training_args.num_train_epochs * len(data_loader))
-    # use ddp
+
     rank = dist.get_rank()
     device_id = rank % torch.cuda.device_count()
-
     if training_args.use_ddp:
         model = model.to(device_id)
         model = DDP(model, device_ids=[device_id], find_unused_parameters = True) 
     
-        
-    # use tp
     # TODO: TP now is imcompatiable with gradient_checkpoint, lazy_linear. 
-    # Dataloader's order should be consistent across different processes when using TP, set shuffle = false
     if training_args.tp > 1:
-        model_tp = deepcopy(model)
-        get_tensor_sharded_model(model_tp, training_args.tp) 
+        get_tensor_sharded_model(model, training_args.tp) 
         dataset = []
         for data in train_dataset: 
             dataset.append(tokenize_batch_for_finetune_tp(data, tokenizer, training_args.model_max_length))   
@@ -189,33 +139,8 @@ def train():
             collate_fn=data_collator,
             use_tp=True
         )
-    
-    # unit test for TP
-    torch.cuda.empty_cache()
-    testcase = TestCase()
 
-    data_iter = iter(data_loader)
-    batch = to_device(next(data_iter), device)
-    output = model(**batch)
-    output_tp = model_tp(**batch)
-    #testcase.assertEqual(output[0], output_tp[0])
-
-    output[0].backward()
-    output_tp[0].backward()
-
-    _check_module_bwd(model, model_tp, check_grad=True)
-    optimizer = torch.optim.Adam(model.parameters(), 2e-5)
-    optimizer_tp = torch.optim.Adam(model_tp.parameters(), 2e-5) 
-    optimizer.step()
-    optimizer_tp.step()
-    _check_module_bwd(model, model_tp, check_grad=True)
-    batch = to_device(next(data_iter), device)
-    output_1 = model(**batch)
-    output_tp_1 = model_tp(**batch)
-    testcase.assertEqual(output_1[0], output_tp_1[0])
-    _check_module_bwd(model, model_tp, check_grad=True)
-
-    # traininig
+    # training
     writer = SummaryWriter("/home/wangbinluo/Finetune_llama2/tensorboard")
     epoch = 0
     step = 0
@@ -229,7 +154,6 @@ def train():
             torch.cuda.synchronize()
             start_time = time.time()
             batch = to_device(batch, device)
-            # autocasting
             if training_args.auto_cast:
                 device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
                 with torch.autocast(device_type=device_type):
@@ -270,7 +194,6 @@ def train():
     
     model.eval()
     writer.close()
-
 
 if __name__ == "__main__":
     train()

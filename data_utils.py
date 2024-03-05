@@ -1,21 +1,21 @@
 import json
 import random
 import os
+import io
 from typing import Iterator, Optional, Dict, Iterator, List, Optional, Sequence, Union, Callable
-
 import numpy as np
 import torch
 import torch.nn.functional as F
-from datasets import Dataset as HFDataset
 from torch.distributed import ProcessGroup
-from datasets import dataset_dict, load_from_disk
+from datasets import dataset_dict
 from torch.distributed.distributed_c10d import _get_default_group
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, DistributedSampler
 import math
 import torch.distributed as dist
 from dataclasses import dataclass
 from transformers.tokenization_utils import PreTrainedTokenizer
-
+from transformers.models.llama.tokenization_llama import LlamaTokenizer
+from copy import deepcopy
 
 DatasetType = Union[Dataset, ConcatDataset, dataset_dict.Dataset]
 PathType = Union[str, os.PathLike]
@@ -25,6 +25,33 @@ def all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
     tensor = tensor.data
     tensor.div_(dist.get_world_size())
     return tensor
+
+def _make_r_io_base(f, mode: str):
+    if not isinstance(f, io.IOBase):
+        f = open(f, mode=mode)
+    return f
+
+def jload(f, mode="r"):
+    """Load a .json file into a dictionary."""
+    f = _make_r_io_base(f, mode)
+    jdict = json.load(f)
+    f.close()
+    return jdict
+
+def tokenize_batch_for_finetune(batch, tokenizer: Optional[LlamaTokenizer] = None, max_length: int = 2048):
+    texts = [sample["prompt"] + sample["completion"] for sample in batch]
+    data = tokenizer(texts, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length)
+    data = {k: v.cuda() for k, v in data.items()}
+    data["labels"] = data["input_ids"].clone()
+    return data
+
+def tokenize_batch_for_finetune_tp(batch, tokenizer: Optional[LlamaTokenizer] = None, max_length: int = 2048):
+    texts = batch["instruction"] + batch["output"]
+    data = tokenizer(texts)
+    data["input_ids"] = torch.LongTensor(data["input_ids"])
+    data["attention_mask"] = torch.LongTensor(data["attention_mask"]) 
+    data["labels"] = deepcopy(data["input_ids"])
+    return data
 
 class StatefulDistributedSampler(DistributedSampler):
     def __init__(
@@ -249,33 +276,3 @@ def setup_distributed_dataloader(
         worker_init_fn=seed_worker,
         **_kwargs,
     )
-
-
-def load_json(file_path: str):
-    with open(file_path, "r") as f:
-        return json.load(f)
-
-
-def save_json(data, file_path: str):
-    with open(file_path, "w") as f:
-        json.dump(data, f, indent=4)
-
-
-class RandomDataset(Dataset):
-    def __init__(self, num_samples: int = 1000, max_length: int = 2048, vocab_size: int = 32000):
-        self.num_samples = num_samples
-        self.max_length = max_length
-        self.input_ids = torch.randint(
-            0, vocab_size, (num_samples, max_length), device=torch.cuda.current_device()
-        )
-        self.attention_mask = torch.ones_like(self.input_ids)
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        return {
-            "input_ids": self.input_ids[idx],
-            "attention_mask": self.attention_mask[idx],
-            "labels": self.input_ids[idx],
-        }

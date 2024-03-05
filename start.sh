@@ -4,7 +4,6 @@ torchrun --nproc_per_node=4 \
     --model_name_or_path /home/zhongyuting/model/Sheared-LLaMA-1.3B \
     --data_path /mnt/jfs/wangbinluo/Finetune_llama2/1024.json \
     --output_dir /mnt/jfs/wangbinluo/Finetune_llama2/output \
-    --lazy_init False \
     --num_train_epochs 1 \
     --per_device_train_batch_size 2 \
     --gradient_accumulation_steps 8 \
@@ -19,3 +18,4 @@ torchrun --nproc_per_node=4 \
     --model_max_length 2048 \
     --use_ddp False\
     --tp 1 \
+    --tensorboard_path /home/wangbinluo/Finetune_llama2/tensorboard \

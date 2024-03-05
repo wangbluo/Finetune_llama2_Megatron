@@ -1,69 +1,17 @@
 import torch
 import torch.distributed as dist
-from torch.testing._internal.common_utils import TestCase
-from transformers import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Optional, Tuple
 from transformers.cache_utils import Cache
+import torch.nn.functional as F
 
-logger = logging.get_logger(__name__)
+# The TensorParallelModelInput class is the f operator before model parallel region,
+# and the TensorParallelModelOutput class is the g opearator after model parallel region.
+# The f is an identity operator in the forward pass and all reduce in the backward pass, 
+# while g is an all reduce in the forward pass and identity in the backward pass.
+# refer: https://arxiv.org/pdf/1909.08053.pdf
 
-device = "cuda" if torch.cuda.is_available() else "cpu" 
-tp_size = 1
-
-def set_tp_size(tp):
-    tp_size = tp
+class TensorParallelModelInput(torch.autograd.Function):
     
-def _check_module(m1, m2, check_grad=False):
-        testcase = TestCase()
-        named_parameters = dict(m1.named_parameters())
-        for name, param_m2 in m2.named_parameters():
-            testcase.assertTrue(name in named_parameters)
-            param_m1 = named_parameters[name]
-            if check_grad:
-                param_m2 = param_m2.grad
-                param_m1 = param_m1.grad
-            testcase.assertEqual(param_m2, param_m1)
-
-def _check_module_bwd(m1, m2, check_grad=False):
-    testcase = TestCase()
-    named_parameters = dict(m1.named_parameters())
-    for name, param_m2 in m2.named_parameters():
-        testcase.assertTrue(name in named_parameters)
-        param_m1 = named_parameters[name]
-        if check_grad:
-            param_m2 = param_m2.grad
-            param_m1 = param_m1.grad
-            if "q_proj" in name or "k_proj" in name or "v_proj" in name or "gate_proj" in name or "up_proj" in name:
-                # cancat the splited param_m2.grad
-                process_group = dist.group.WORLD
-                tensor_list = [torch.empty_like(param_m2) for _ in range(dist.get_world_size())]
-                rank = dist.get_rank()
-                tensor_list[rank] = param_m2     
-                dist.all_gather(tensor_list, param_m2, group=process_group)
-                # Note: torch.cat already creates a contiguous tensor.
-                first_dim = param_m2.shape[0]
-                param_m2 = torch.cat(tensor_list, dim = 0).contiguous()
-            if "o_proj" in name or "down_proj" in name:
-                # cancat the splited param_m2.grad
-                process_group = dist.group.WORLD
-                tensor_list = [torch.empty_like(param_m2) for _ in range(dist.get_world_size())]
-                rank = dist.get_rank()
-                tensor_list[rank] = param_m2     
-                dist.all_gather(tensor_list, param_m2, group=process_group)
-                # Note: torch.cat already creates a contiguous tensor.
-                first_dim = param_m2.shape[0]
-                param_m2 = torch.cat(tensor_list, dim = -1).contiguous()
-                
-        testcase.assertEqual(param_m2, param_m1)
- 
-#before q, k, v_proj
-class InputTpLinear(torch.autograd.Function):
-    """Pass the input to the model parallel region."""
-
-    @staticmethod
-    def symbolic(graph, input_):
-        return input_
-
     @staticmethod
     def forward(ctx, input_):
         return input_
@@ -76,64 +24,25 @@ class InputTpLinear(torch.autograd.Function):
         dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=process_group)
         return grad_output 
 
-def input_tp_linear(input):
-    return InputTpLinear.apply(input)
+def tensor_parallel_model_input(input):
+    return TensorParallelModelInput.apply(input)
 
-# for the q k v_proj output
-class ColTpLinear(torch.autograd.Function):
+class TensorParallelModelOutput(torch.autograd.Function):
+        
     @staticmethod
     def forward(ctx, output):
-        #split qkv_weight have already done in get_tensor_sharded_model() 
-        
+        process_group = dist.group.WORLD
+        if not output.is_contiguous():
+            output = output.contiguous()
+        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=process_group)
         return output
         
     @staticmethod
     def backward(ctx, grad):
-        #all_gather the grad, [384, 768] -> [768, 768]
-        print(grad)
-        print(grad.shape)
-        process_group = dist.group.WORLD
-        tensor_list = [torch.empty_like(grad) for _ in range(dist.get_world_size())]
-        rank = dist.get_rank()
-        tensor_list[rank] = grad     
-        dist.all_gather(tensor_list, grad, group=process_group)
-        # Note: torch.cat already creates a contiguous tensor.
-        first_dim = grad.shape[0]
-        grad = torch.cat(tensor_list, dim=first_dim).contiguous()
-        return grad
-
-def col_tp_linear(output):
-    return ColTpLinear.apply(output)  
-  
-# for the o_proj output
-class RowTpLinear(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, output):
-        # Use c10d collectselfops
-        process_group = dist.group.WORLD
-        if not output[0].is_contiguous():
-            output[0] = output[0].contiguous()
-        dist.all_reduce(output[0], op=dist.ReduceOp.SUM, group=process_group)
-        return output[0]
-        
-    @staticmethod
-    def backward(ctx, grad):
-        print(grad.shape)
-        print(grad)
-        process_group = dist.group.WORLD
-        if not grad.is_contiguous():
-            grad = grad.contiguous()
-        col_split_dim = grad.shape[-1] 
-        split_tensors = torch.split(grad, col_split_dim, dim = -1)
-        for i in range(len(split_tensors)):
-            if dist.get_rank()==i:
-                grad = split_tensors[i].to(f"{device}:{i}")
-        print("split_grad_shape:",grad.shape)
-        print("split_grad:",grad)
         return grad
     
-def row_tp_linear(output):
-    return RowTpLinear.apply(output)
+def tensor_parallel_model_output(output):
+    return TensorParallelModelOutput.apply(output)
         
 def bind(instance, func, as_name=None):
     """
@@ -148,13 +57,12 @@ def bind(instance, func, as_name=None):
     return bound_method
     
 def get_tensor_sharded_model(model, tp_size):
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu" 
 
     # Parallelize the Attention and MLP submodules.
     for layer in model.model.layers:
-        # nn.linear will transpose the weight, so we should do row split for qkv and do col split for o.
-        # For example, we should make q shape from [2048, 2048] -> [1024, 2048]
-        set_tp_size(tp_size)
-        
+        # nn.linear will transpose the weight, so do row split for qkv and do col split for o.       
         layer.self_attn.tp = tp_size
         
         q_proj = layer.self_attn.q_proj.weight
@@ -168,7 +76,6 @@ def get_tensor_sharded_model(model, tp_size):
         split_k_tensors = torch.split(k_proj, row_split_dim, dim = 0)
         split_v_tensors = torch.split(v_proj, row_split_dim, dim = 0)
         split_o_tensors = torch.split(o_proj, col_split_dim, dim = -1)
-        # tp_size is no need larger than device_count
         for i in range(len(split_q_tensors)):
             if dist.get_rank()==i:
                 layer.self_attn.q_proj.weight.data = split_q_tensors[i].to(f"{device}:{i}")
@@ -176,7 +83,7 @@ def get_tensor_sharded_model(model, tp_size):
                 layer.self_attn.v_proj.weight.data = split_v_tensors[i].to(f"{device}:{i}")
                 layer.self_attn.o_proj.weight.data = split_o_tensors[i].to(f"{device}:{i}")
    
-        bind(layer.self_attn, forward, "forward")
+        bind(layer.self_attn, attention_forward, "forward")
 
         # Manually adjust the number of heads after sharding the self attention modules.
         # For Llama2 models, your should adjust the number of heads separately.
@@ -185,9 +92,7 @@ def get_tensor_sharded_model(model, tp_size):
         layer.self_attn.num_key_value_heads = model.model.config.num_key_value_heads // dist.get_world_size()
         layer.self_attn.hidden_size = model.model.config.hidden_size // dist.get_world_size()
         
-        torch.cuda.empty_cache()
-        
-        """# shard the MLP part
+        # shard the MLP Model
         layer.mlp.tp= tp_size
         gate_proj = layer.mlp.gate_proj.weight
         up_proj = layer.mlp.up_proj.weight
@@ -203,9 +108,10 @@ def get_tensor_sharded_model(model, tp_size):
                 layer.mlp.up_proj.weight.data = split_up_tensors[i].to(f"{device}:{i}")
                 layer.mlp.down_proj.weight.data = split_down_tensors[i].to(f"{device}:{i}")
    
-        bind(layer.mlp, mlp_forward, "forward") """
+        bind(layer.mlp, mlp_forward, "forward")
+        
+        torch.cuda.empty_cache()
     
-# bind the new forward function with llama2 model's self_attn
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -231,7 +137,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
     
-def forward(
+def attention_forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -244,7 +150,7 @@ def forward(
 
         bsz, q_len, _ = hidden_states.size()
         if hasattr(self, 'tp') and self.tp > 1:
-            hidden_states = input_tp_linear(hidden_states)
+            hidden_states = tensor_parallel_model_input(hidden_states)
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
@@ -289,17 +195,13 @@ def forward(
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
-
         attn_output = self.o_proj(attn_output)
         
         if hasattr(self, 'tp') and self.tp > 1:
-            attn_output = row_tp_linear(attn_output)
+            attn_output = tensor_parallel_model_output(attn_output)
 
-        return attn_output, None, past_key_value 
-      
-        
-# bind the new forward function with llama2 model's self_attn
-import torch.nn.functional as F
+        return attn_output, None, past_key_value       
+
 def mlp_forward(self, x):
     if self.config.pretraining_tp > 1:
         slice = self.intermediate_size // self.config.pretraining_tp
@@ -319,9 +221,9 @@ def mlp_forward(self, x):
         down_proj = sum(down_proj)
     else:
         if hasattr(self, 'tp') and self.tp > 1:
-            x = input_tp_linear(x)
+            x = tensor_parallel_model_input(x)
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         if hasattr(self, 'tp') and self.tp > 1:
-            down_proj = row_tp_linear(down_proj)   
+            down_proj = tensor_parallel_model_output(down_proj)   
 
     return down_proj
