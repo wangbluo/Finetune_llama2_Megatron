@@ -10,7 +10,7 @@ import torch.nn.functional as F
 # while g is an all reduce in the forward pass and identity in the backward pass.
 # refer: https://arxiv.org/pdf/1909.08053.pdf
 
-class TensorParallelModelInput(torch.autograd.Function):
+class InputToTensorParallelModel(torch.autograd.Function):
     
     @staticmethod
     def forward(ctx, input_):
@@ -24,10 +24,10 @@ class TensorParallelModelInput(torch.autograd.Function):
         dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=process_group)
         return grad_output 
 
-def tensor_parallel_model_input(input):
-    return TensorParallelModelInput.apply(input)
+def input_to_tensor_parallel_model(input):
+    return InputToTensorParallelModel.apply(input)
 
-class TensorParallelModelOutput(torch.autograd.Function):
+class OutputFromTensorParallelModel(torch.autograd.Function):
         
     @staticmethod
     def forward(ctx, output):
@@ -41,8 +41,8 @@ class TensorParallelModelOutput(torch.autograd.Function):
     def backward(ctx, grad):
         return grad
     
-def tensor_parallel_model_output(output):
-    return TensorParallelModelOutput.apply(output)
+def output_from_tensor_parallel_model(output):
+    return OutputFromTensorParallelModel.apply(output)
         
 def bind(instance, func, as_name=None):
     """
@@ -150,7 +150,7 @@ def attention_forward(
 
         bsz, q_len, _ = hidden_states.size()
         if hasattr(self, 'tp') and self.tp > 1:
-            hidden_states = tensor_parallel_model_input(hidden_states)
+            hidden_states = input_to_tensor_parallel_model(hidden_states)
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
@@ -198,7 +198,7 @@ def attention_forward(
         attn_output = self.o_proj(attn_output)
         
         if hasattr(self, 'tp') and self.tp > 1:
-            attn_output = tensor_parallel_model_output(attn_output)
+            attn_output = output_from_tensor_parallel_model(attn_output)
 
         return attn_output, None, past_key_value       
 
@@ -221,9 +221,9 @@ def mlp_forward(self, x):
         down_proj = sum(down_proj)
     else:
         if hasattr(self, 'tp') and self.tp > 1:
-            x = tensor_parallel_model_input(x)
+            x = input_to_tensor_parallel_model(x)
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         if hasattr(self, 'tp') and self.tp > 1:
-            down_proj = tensor_parallel_model_output(down_proj)   
+            down_proj = output_from_tensor_parallel_model(down_proj)   
 
     return down_proj
