@@ -4,8 +4,8 @@ from typing import Optional, Tuple
 from transformers.cache_utils import Cache
 import torch.nn.functional as F
 
-# The TensorParallelModelInput class is the f operator before model parallel region,
-# and the TensorParallelModelOutput class is the g opearator after model parallel region.
+# The InputToTensorParallelModel class is the f operator before model parallel region, 
+# and the OutputFromTensorParallelModel class is the g opearator after model parallel region.
 # The f is an identity operator in the forward pass and all reduce in the backward pass, 
 # while g is an all reduce in the forward pass and identity in the backward pass.
 # refer: https://arxiv.org/pdf/1909.08053.pdf

@@ -1,12 +1,10 @@
 import torch.distributed as dist
 import torch
 from dataclasses import dataclass, field
-from datasets import load_dataset
 from typing import Optional
 from transformers import TrainingArguments as TrainArgs, HfArgumentParser as HfArgs
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.llama.tokenization_llama import LlamaTokenizer
-import torch.distributed as dist
 import time
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tensor_parallel import get_tensor_sharded_model
@@ -59,6 +57,7 @@ class TrainingArguments(TrainArgs):
         default=512,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
+    tensorboard_path: str = field(default="tensorboard")  
 
 def print_rank0(msg):
     rank = dist.get_rank()
@@ -73,7 +72,6 @@ def get_model_size(model: torch.nn.Module):
     return total_numel
 
 def get_tflops(grad_checkpoint, model_numel, batch_size, seq_len, step_time):
-    
     return model_numel * batch_size * seq_len * (8 if grad_checkpoint else 6) / 1e12 / (step_time + 1e-12)
 
 def to_device(batch, device):
@@ -141,7 +139,7 @@ def train():
         )
 
     # training
-    writer = SummaryWriter("/home/wangbinluo/Finetune_llama2/tensorboard")
+    writer = SummaryWriter(training_args.tensorboard_path)
     epoch = 0
     step = 0
 

@@ -3,10 +3,8 @@ torchrun --nproc_per_node=4 \
     finetune_llama2.py \
     --model_name_or_path /home/zhongyuting/model/Sheared-LLaMA-1.3B \
     --data_path /mnt/jfs/wangbinluo/Finetune_llama2/1024.json \
-    --output_dir /mnt/jfs/wangbinluo/Finetune_llama2/output \
-    --num_train_epochs 1 \
+    --num_train_epochs 2 \
     --per_device_train_batch_size 2 \
-    --gradient_accumulation_steps 8 \
     --optimizer "adam" \
     --learning_rate 2e-5 \
     --adam_beta1 "0.9" \
@@ -17,5 +15,5 @@ torchrun --nproc_per_node=4 \
     --auto_cast False \
     --model_max_length 2048 \
     --use_ddp False\
-    --tp 1 \
+    --tp 2 \
     --tensorboard_path /home/wangbinluo/Finetune_llama2/tensorboard \
