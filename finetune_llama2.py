@@ -77,6 +77,12 @@ def get_tflops(grad_checkpoint, model_numel, batch_size, seq_len, step_time):
 def to_device(batch, device):
     return {k: v.to(device) for k, v in batch.items()}
 
+def save_ckpt(model, path):
+    model_path = path + "/pytorch_model.bin"
+    model_state = model.state_dict()  # each process must run model.state_dict()
+    if dist.get_rank() == 0:
+        torch.save(model_state, model_path)
+
 def train():
     parser = HfArgs((ModelArguments, DataArguments, TrainingArguments))
     setup()
@@ -192,6 +198,7 @@ def train():
     
     model.eval()
     writer.close()
+    save_ckpt(model, training_args.output_dir)
 
 if __name__ == "__main__":
     train()
