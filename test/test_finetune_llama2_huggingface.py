@@ -11,6 +11,7 @@ output = """The erroneous code seems to be trying to solve the problem correctly
 # tatsu-lab/alpaca
 #instruction = """Give three tips for staying healthy."""
 #output = """1.Eat a balanced diet and make sure to include plenty of fruits and vegetables. \n2. Exercise regularly to keep your body active and strong. \n3. Get enough sleep and maintain a consistent sleep schedule.', 'text': 'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nGive three tips for staying healthy.\n\n### Response:\n1.Eat a balanced diet and make sure to include plenty of fruits and vegetables. \n2. Exercise regularly to keep your body active and strong. \n3. Get enough sleep and maintain a consistent sleep schedule."""
+
 model = LlamaForCausalLM.from_pretrained("openlm-research/open_llama_3b")
 tokenizer = AutoTokenizer.from_pretrained("openlm-research/open_llama_3b")
 
