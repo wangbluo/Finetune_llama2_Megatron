@@ -7,7 +7,7 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers.models.llama.tokenization_llama import LlamaTokenizer
 import time
 from torch.nn.parallel import DistributedDataParallel as DDP
-from tensor_parallel import get_tensor_sharded_model
+from tensor_parallel import get_tensor_sharded_model, merge_tensor_sharded_model
 from torch.utils.tensorboard import SummaryWriter
 from functools import partial
 from data_utils import (DataCollatorForSupervisedDataset, 
@@ -77,6 +77,12 @@ def get_tflops(grad_checkpoint, model_numel, batch_size, seq_len, step_time):
 def to_device(batch, device):
     return {k: v.to(device) for k, v in batch.items()}
 
+def save_ckpt(model, path):
+    model_path = path + "/pytorch_model.bin"
+    model_state = model.state_dict()  # each process must run model.state_dict()
+    if dist.get_rank() == 0:
+        torch.save(model_state, model_path)
+
 def train():
     parser = HfArgs((ModelArguments, DataArguments, TrainingArguments))
     setup()
@@ -92,7 +98,7 @@ def train():
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
-    tokenizer = LlamaTokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
+    tokenizer = LlamaTokenizer.from_pretrained(model_args.model_name_or_path)
     tokenizer.pad_token = tokenizer.unk_token
     train_dataset = jload(data_args.data_path)
     data_loader = setup_distributed_dataloader(train_dataset,
@@ -192,6 +198,10 @@ def train():
     
     model.eval()
     writer.close()
+    if training_args.tp > 1:
+        merge_tensor_sharded_model(model)
+        
+    save_ckpt(model, training_args.output_dir)
 
 if __name__ == "__main__":
     train()

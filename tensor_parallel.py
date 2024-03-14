@@ -3,6 +3,7 @@ import torch.distributed as dist
 from typing import Optional, Tuple
 from transformers.cache_utils import Cache
 import torch.nn.functional as F
+import re
 
 # The InputToTensorParallelModel class is the f operator before model parallel region, 
 # and the OutputFromTensorParallelModel class is the g opearator after model parallel region.
@@ -227,3 +228,53 @@ def mlp_forward(self, x):
             down_proj = output_from_tensor_parallel_model(down_proj)   
 
     return down_proj
+
+def merge_tensor_sharded_model(model):
+    named_parameters = dict(model.named_parameters())
+    for name in model.named_parameters():
+        param = named_parameters[name[0]]
+        with torch.no_grad():
+            if "q_proj" in name[0] or "k_proj" in name[0] or "v_proj" in name[0] or "gate_proj" in name[0] or "up_proj" in name[0]:    
+                param = param.contiguous() 
+                process_group = dist.group.WORLD
+                tensor_list = [torch.empty_like(param) for _ in range(dist.get_world_size())]
+                rank = dist.get_rank()
+                tensor_list[rank] = param     
+                dist.all_gather(tensor_list, param, group=process_group)
+                param = torch.cat(tensor_list, dim = 0).contiguous()
+                match = re.match(r'^model\.layers\.(\d+)\.(\w+)\.(\w+)\.weight$', name[0])
+                layer_num = int(match.group(1))
+                if "q_proj" in name[0]: 
+                    model.model.layers[layer_num].self_attn.q_proj.weight.data = param
+                elif "k_proj" in name[0]: 
+                    model.model.layers[layer_num].self_attn.k_proj.weight.data = param
+                elif "v_proj" in name[0]: 
+                    model.model.layers[layer_num].self_attn.v_proj.weight.data = param
+                elif "gate_proj" in name[0]: 
+                    model.model.layers[layer_num].mlp.gate_proj.weight.data = param 
+                elif "up_proj" in name[0]: 
+                    model.model.layers[layer_num].mlp.up_proj.weight.data = param
+                    
+            elif "o_proj" in name[0] or "down_proj" in name[0]:
+                param = param.contiguous() 
+                process_group = dist.group.WORLD
+                tensor_list = [torch.empty_like(param) for _ in range(dist.get_world_size())]
+                rank = dist.get_rank()
+                tensor_list[rank] = param     
+                dist.all_gather(tensor_list, param, group=process_group)
+                param = torch.cat(tensor_list, dim = -1).contiguous()
+                match = re.match(r'^model\.layers\.(\d+)\.(\w+)\.(\w+)\.weight$', name[0])
+                layer_num = int(match.group(1))
+                if "o_proj" in name[0]: 
+                    model.model.layers[layer_num].self_attn.o_proj.weight.data = param
+                elif "down_proj" in name[0]: 
+                    model.model.layers[layer_num].mlp.down_proj.weight.data = param
+
+   
+    for layer in model.model.layers:
+        layer.self_attn.num_heads = model.model.config.num_attention_heads * dist.get_world_size()
+        layer.self_attn.num_key_value_heads = model.model.config.num_key_value_heads * dist.get_world_size()
+        layer.self_attn.hidden_size = model.model.config.hidden_size * dist.get_world_size()
+   
+    torch.cuda.empty_cache()
+        
