@@ -195,8 +195,6 @@ def train():
                         f"tflops: {tflops:.2f}")
             writer.add_scalar("loss", loss.item(),step)
             torch.cuda.empty_cache()
-            if step == 3:
-                break
     
     model.eval()
     writer.close()
