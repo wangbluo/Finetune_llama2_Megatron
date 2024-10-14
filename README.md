@@ -5,7 +5,7 @@ Building a llama fine-tuning script from scratch using PyTorch and the transform
 The loss curve:
 ![img_v3_0284_f9313a8e-9e61-41fc-b35f-5d2e7e991aag](https://github.com/wangbluo/Finetune_llama2_Megatron/assets/32676639/14245e6c-8b3a-43c4-93d4-356951606a95)
 
-Multiple nodes:
+Multiple nodes scripts:
 
 torchrun --nnodes 2 --node_rank=0 --master_addr=10.90.1.166 --nproc_per_node=8  finetune.py 
 torchrun --nnodes 2 --node_rank=1 --master_addr=10.90.1.166 --nproc_per_node=8  finetune.py 
